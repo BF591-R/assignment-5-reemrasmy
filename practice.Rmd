@@ -3,3 +3,202 @@ title: "practice"
 output: html_document
 ---
 
+Problem 1: Generating the Summarized Experiment Object
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#Read in verse_counts.tsv and sample_metadata.csv and subset to the listed samples
+#Store these dataframes in a SummarizedExperiment object and display the summary here
+make_se <- function(counts_csv, metafile_csv, selected_times) {
+  
+  counts <- read_tsv(counts_csv)
+  metadata <- read_csv(metafile_csv)
+  
+  # Subet the metadata for the portion we are using 
+  subset_meta <- metadata %>%
+    filter(timepoint %in% selected_times) %>%
+    mutate(timepoint = factor(timepoint, levels=c("vP0", "vAd"))) %>%
+    dplyr::select(samplename, timepoint)
+  
+  # Subset the counts table using the subsetted metadata 
+  # all_of() -- ; 1 is the gene column, instead of hardcoding "gene"
+  subset_counts <- counts %>%
+    dplyr::select(1, all_of(subset_meta$samplename))
+  
+  # Create the counts matrix
+  counts_matrix <- subset_counts %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+  
+  # Create SummarizedExperiment object 
+  se <- SummarizedExperiment(
+    assays = list(counts = counts_matrix),
+    colData = subset_meta
+  )
+
+  return(se)
+}
+
+se <- make_se("data/verse_counts.tsv", "data/sample_metadata.csv", c("vP0", "vAd"))
+se
+assayNames(se)
+colData(se)
+colnames(assay(se, "counts"))
+rownames(colData(se))
+```
+
+Problem 2: Running DESeq2
+```{r}
+return_deseq_res <- function(se, design) {
+  # Create the dds object by converting se to DESeqDataSet object
+  dds <- DESeqDataSet(se, design = design) %>%
+    DESeq()
+  # Extract results table as a df
+  res_df <- results(dds) %>%
+    as.data.frame()
+  
+  # Return results and DESeqDataSet as list
+  deseq_out <- list(dds = dds, results = res_df)
+  
+  return(deseq_out)
+}
+
+
+```
+
+Problem 3: Annotating Results to Create Volcano Plot
+
+```{r}
+label_res <- function(deseq2_res, padj_threshold) {
+  deseq_res_tib <- deseq2_res %>%
+    tibble::rownames_to_column("genes") %>%
+    as_tibble() %>%
+    
+    mutate(
+      volc_plot_status = case_when(
+        is.na(padj) | is.na(log2FoldChange) ~ "NS", 
+        padj < padj_threshold & log2FoldChange > 0 ~ "UP",
+        padj < padj_threshold & log2FoldChange < 0 ~ "DOWN",
+        TRUE ~ "NS"
+      )
+    )
+  return(deseq_res_tib)
+}
+
+```
+
+Problem 4: Graphs 
+
+```{r}
+scatter_norm_counts <- function(labeled_results, dds_obj, num_genes){
+  
+  # extract sample metadata
+  sample_metadata <- as.data.frame(colData(dds_obj))
+  
+  # find top genes by smallest padj
+  top_genes <- labeled_results %>%
+    filter(!is.na(padj)) %>%
+    arrange(padj) %>%
+    slice_head(n = num_genes) %>%
+    pull(genes)
+  
+  # extract normalized counts from dds
+  norm_counts <- counts(dds_obj, normalized = TRUE)
+  
+  # subset counts to top genes
+  top_gene_counts <- norm_counts[top_genes, ] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("genes") %>%
+    as_tibble() %>%
+    pivot_longer(
+      cols= -genes,
+      names_to="samplename",
+      values_to="counts"
+  ) %>%
+  left_join(sample_metadata, by = "samplename")
+
+  
+  # make scatter plot
+  scatt_plot <- ggplot(top_gene_counts, aes(x = samplename, y = counts, color = timepoint)) +
+  geom_point() +
+  facet_wrap(vars(genes)) +
+  labs(
+    title = "Normalized counts for top differentially expressed genes",
+    x = "Sample name",
+    y = "Normalized counts"
+  )
+  
+  return(scatt_plot)
+}
+
+norm_counts_plot <- scatter_norm_counts(labeled_results, dds, 10)
+norm_counts_plot
+```
+
+Problem 8: Preparing & Running FGSEA
+
+```{r}
+make_ranked_log2fc <- function(labeled_results, id2gene_path) {
+  gene_names <- read_tsv(id2gene_path,col_names = c("genes", "symbols"))
+  
+  join_symbols <- left_join(labeled_results, gene_names, by = "genes") %>%
+    filter(!is.na(log2FoldChange), !is.na(symbols))
+  
+  gene_fc_vec <- setNames(join_symbols$log2FoldChange, join_symbols$symbols)
+  ranked_vec <- sort(gene_fc_vec, decreasing=TRUE)
+  
+  return(ranked_vec)
+}
+
+run_fgsea <- function(gmt_file_path, rnk_list, min_size, max_size) {
+  
+  # returns a list of pathways from the gmt file (input) 
+  pathways <- gmtPathways(gmt_file_path)
+  
+  # removing the duplicate gene names (failed in previous test)
+  rnk_list <- rnk_list[!duplicated(names(rnk_list))]
+  
+  # run fgsea and convert results to a tibble
+  fgsea_tib <- fgsea(pathways, rnk_list, minSize = min_size, maxSize = max_size) %>%
+    as_tibble()
+  
+  return(fgsea_tib)
+}
+
+rnk_list <- make_ranked_log2fc(labeled_results, 'data/id2gene.txt')
+fgsea_results <- run_fgsea('data/m2.cp.v2023.1.Mm.symbols.gmt', rnk_list, 15, 500)
+fgsea_results
+```
+Problem 9: Plotting NES 
+
+```{r}
+top_pathways <- function(fgsea_results, num_paths){
+  
+  top_pos_paths <- fgsea_results %>% 
+    arrange(padj) %>%  
+    filter(NES > 0) %>%
+    slice_max(NES, n=num_paths)
+  
+  top_neg_paths <- fgsea_results %>%
+    arrange(padj) %>%
+    filter(NES < 0) %>%
+    slice_max(NES, n=num_paths)
+  
+  top_paths <- bind_rows(top_pos_paths, top_neg_paths)
+  
+  top_paths_plots <- top_paths %>%
+    mutate(pathway = forcats::fct_reorder(pathway, NES)) %>%
+    ggplot() +
+    geom_bar(aes(x=pathway, y=NES, fill = padj < .25), stat='identity') +
+    scale_fill_manual(values = c('TRUE' = 'red', 'FALSE' = 'blue')) + 
+    theme_minimal() +
+    ggtitle('FGSEA Results for vP0 and vAd Mouse Heart Gene Sets') +
+    ylab('Normalized Enrichment Score (NES)') +
+    xlab('') +
+    coord_flip()
+    
+  return(top_paths_plots)
+}
+
+fgsea_plot <- top_pathways(fgsea_results, 10)
+fgsea_plot
+```
